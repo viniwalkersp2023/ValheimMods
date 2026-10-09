@@ -1,0 +1,1673 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using BepInEx;
+using BepInEx.Configuration;
+using HarmonyLib;
+using UnityEngine;
+
+namespace ViniTotem
+{
+    [BepInPlugin("com.viniwalkersp.vinitotem", "ViniTotem", "1.1.1")]
+    [BepInDependency("com.jotunn.jotunn", BepInDependency.DependencyFlags.SoftDependency)]
+    public class ViniTotemPlugin : BaseUnityPlugin
+    {
+        public const string PrefabName = "ViniSkillTotem";
+        const string CoinName = "$item_coins";
+
+        static ViniTotemPlugin _inst;
+        static GameObject _template;
+        static FieldInfo _fSince, _fCool;
+
+        public static readonly Dictionary<Skills.SkillType, float> Lost = new Dictionary<Skills.SkillType, float>();
+        public static float LastDeathTime = -99999f;
+        public static bool Claimed = false;
+        public static float RestoredTotal = 0f;
+
+        static bool _dialogOpen = false;
+        public static bool DialogOpen { get { return _dialogOpen; } }
+        static Vector3 _dialogPos;
+        static Vector2 _scroll;
+
+        ConfigEntry<int> _price;
+        ConfigEntry<string> _glbFile;
+
+        void Awake()
+        {
+            _inst = this;
+            _price = Config.Bind("Geral", "PrecoMoedas", 3000, "Moedas cobradas para recuperar as habilidades perdidas.");
+            _glbFile = Config.Bind("Geral", "ModeloGLB", "tonzite_final.glb", "Arquivo .glb na pasta do mod para o visual do totem (vazio = visual da ward).");
+            try
+            {
+                _fSince = typeof(Player).GetField("m_timeSinceDeath", BindingFlags.NonPublic | BindingFlags.Instance);
+                _fCool = typeof(Player).GetField("m_hardDeathCooldown", BindingFlags.NonPublic | BindingFlags.Instance);
+                _miAddKnown = typeof(Player).GetMethod("AddKnownPiece", BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+            catch { }
+            try
+            {
+                var h = new Harmony("com.viniwalkersp.vinitotem");
+                h.PatchAll();
+                Logger.LogInfo("[ViniTotem] 1.1.1 por viniwalkersp - patch ok");
+            }
+            catch (Exception e) { Logger.LogError("[ViniTotem] patch falhou: " + e); }
+            _useJotunn = Type.GetType("Jotunn.Managers.PieceManager, Jotunn") != null;
+            Logger.LogInfo("[ViniTotem] Jotunn detectado: " + _useJotunn);
+            if (_useJotunn)
+            {
+                try { JotunnBridge.SubscribeVanillaPrefabs(); }
+                catch (Exception e) { Logger.LogError("[ViniTotem] subscribe Jotunn: " + e.Message); }
+            }
+        }
+
+        // ============ PEÇA DO MARTELO ============
+        public static void EnsureInHammerTable(PieceTable table)
+        {
+            try
+            {
+                EnsureTemplate();
+                if (_template == null) return;
+                var piece = _template.GetComponent<Piece>();
+                if (piece == null) return;
+                // A tabela do martelo sobrevive a troca de sessao/personagem, mas os
+                // GameObjects da cena nao. Sem esta limpeza, a referencia morta do
+                // template da sessao anterior fica em m_pieces e ObjectDB.GetAllBuildPieces
+                // (usado pelo mod de conquistas) quebra com NRE todo frame, congelando o jogo.
+                table.m_pieces.RemoveAll(g => g == null || (g != _template && g.name == PrefabName));
+                table.m_enabledPieces.RemoveWhere(p => p == null || (p.gameObject != _template && p.gameObject.name == PrefabName));
+                table.m_availablePieces.RemoveWhere(p => p == null || (p.gameObject != _template && p.gameObject.name == PrefabName));
+                // Tabela de plans do PlanBuild: nao recebe a peca crua (o menu so
+                // mostra versoes "plan", geradas pelo rescan). So limpa + rescan.
+                if (table.gameObject != null && table.gameObject.name == "_PlanHammerPieceTable") return;
+                if (!table.m_pieces.Contains(_template)) table.m_pieces.Add(_template);
+                if (piece.m_placeEffect == null)
+                    foreach (var go in table.m_pieces)
+                    {
+                        if (go == null || go == _template) continue;
+                        var q = go.GetComponent<Piece>();
+                        if (q != null && q.m_placeEffect != null) { piece.m_placeEffect = q.m_placeEffect; break; }
+                    }
+                table.m_enabledPieces.Add(piece);
+                table.m_availablePieces.Add(piece);
+                if (_inst != null) _inst.Logger.LogInfo("[ViniTotem] totem injetado na tabela " + table.gameObject.name + " (pecas=" + table.m_pieces.Count + ").");
+            }
+            catch { }
+        }
+
+        // ============ TOTEM TEMPLATE ============
+        static Material StealMaterial(bool emissive, bool opaqueOnly = false)
+        {
+            try
+            {
+                var zns = ZNetScene.instance;
+                if (zns == null || zns.m_prefabs == null) return null;
+                Material baseMat = null;
+                foreach (var p in zns.m_prefabs)
+                {
+                    if (p == null) continue;
+                    var r = p.GetComponentInChildren<MeshRenderer>(true);
+                    if (r != null && r.sharedMaterial != null && r.sharedMaterial.shader != null
+                        && r.sharedMaterial.shader.name.Contains("Standard")
+                        && (!opaqueOnly || r.sharedMaterial.renderQueue < 2500)) { baseMat = r.sharedMaterial; break; }
+                }
+                if (baseMat == null)
+                    foreach (var p in zns.m_prefabs)
+                    {
+                        if (p == null) continue;
+                        var r = p.GetComponentInChildren<MeshRenderer>(true);
+                        if (r != null && r.sharedMaterial != null
+                            && (!opaqueOnly || r.sharedMaterial.renderQueue < 2500)) { baseMat = r.sharedMaterial; break; }
+                    }
+                if (baseMat == null) return null;
+                var m = UnityEngine.Object.Instantiate(baseMat);
+                if (m.HasProperty("_Color")) m.color = emissive ? new Color(0.05f, 0.12f, 0.14f) : new Color(0.32f, 0.32f, 0.37f);
+                if (emissive && m.HasProperty("_EmissionColor"))
+                {
+                    m.SetColor("_EmissionColor", new Color(0.2f, 0.85f, 1f) * 1.6f);
+                    m.EnableKeyword("_EMISSION");
+                }
+                else if (emissive && m.HasProperty("_Color")) m.color = new Color(0.2f, 0.85f, 1f);
+                return m;
+            }
+            catch { return null; }
+        }
+
+        public static void EnsureTemplate()
+        {
+            if (_template != null) return;
+            if (_useJotunn) { EnsureJotunnTotem(); if (_template != null) return; }
+            var zns = ZNetScene.instance;
+            if (zns == null || zns.m_prefabs == null) return;
+            foreach (var p in zns.m_prefabs)
+                if (p != null && p.name == PrefabName) { _template = p; return; }
+            try
+            {
+                GameObject wardPrefab = zns.GetPrefab("guard_stone");
+                if (wardPrefab != null && BuildFromWard(wardPrefab, zns)) return;
+                BuildPrimitive(zns);
+            }
+            catch (Exception e) { if (_inst != null) _inst.Logger.LogError("[ViniTotem] template falhou: " + e); }
+        }
+
+        // Caminho Jotunn: usa o prefab ja registrado/clonado por ele e so
+        // remove a logica da ward + adiciona interacao/icone proprios.
+        static void EnsureJotunnTotem()
+        {
+            if (_jotunnReady) return;
+            GameObject prefab = null;
+            try { prefab = JotunnBridge.FetchTotem(); }
+            catch { return; }
+            if (prefab == null) return;
+            try
+            {
+                foreach (var mb in prefab.GetComponentsInChildren<MonoBehaviour>(true))
+                {
+                    if (mb == null) continue;
+                    var t = mb.GetType();
+                    if (t == typeof(ZNetView) || t == typeof(Piece) || t == typeof(WearNTear) || t == typeof(TotemInteract)) continue;
+                    UnityEngine.Object.Destroy(mb);
+                }
+                foreach (var r in prefab.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r == null) continue;
+                    string n = r.gameObject.name.ToLowerInvariant();
+                    if (n.Contains("bubble") || n.Contains("shield") || n.Contains("field") || n.Contains("area") || n.Contains("fx") || n.Contains("effect"))
+                        r.gameObject.SetActive(false);
+                }
+                if (prefab.GetComponent<TotemInteract>() == null) prefab.AddComponent<TotemInteract>();
+                var piece = prefab.GetComponent<Piece>();
+                if (piece != null && piece.m_icon == null) piece.m_icon = StealIcon();
+                TryApplyCustomVisual(prefab);
+                _template = prefab;
+                _jotunnReady = true;
+                Log("template Jotunn ok.");
+            }
+            catch { }
+        }
+
+        static Sprite StealIcon()
+        {
+            try
+            {
+                var zns = ZNetScene.instance;
+                if (zns == null) return null;
+                foreach (var n in new string[] { "SurtlingCore", "GreydwarfEye", "Coins", "FineWood" })
+                {
+                    var d = zns.GetPrefab(n)?.GetComponent<ItemDrop>();
+                    if (d != null && d.m_itemData != null && d.m_itemData.m_shared != null
+                        && d.m_itemData.m_shared.m_icons != null && d.m_itemData.m_shared.m_icons.Length > 0
+                        && d.m_itemData.m_shared.m_icons[0] != null)
+                        return d.m_itemData.m_shared.m_icons[0];
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // Clona a ward (guard_stone): visual, icone e efeito de colocacao vanilla.
+        // Remove a logica da ward (bolha de protecao + E de ligar/desligar) e
+        // configura como peca propria. m_forceDisableInit impede que o ZNetView
+        // acorde durante o Instantiate e crie um ZDO fantasma (o bug do flood).
+        static bool BuildFromWard(GameObject wardPrefab, ZNetScene zns)
+        {
+            try
+            {
+                ZNetView.m_forceDisableInit = true;
+                GameObject go = null;
+                try { go = UnityEngine.Object.Instantiate(wardPrefab); }
+                finally { ZNetView.m_forceDisableInit = false; }
+                if (go == null) return false;
+                go.name = PrefabName;
+                go.SetActive(false);
+                foreach (var mb in go.GetComponentsInChildren<MonoBehaviour>(true))
+                {
+                    if (mb == null) continue;
+                    var t = mb.GetType();
+                    if (t == typeof(ZNetView) || t == typeof(Piece) || t == typeof(WearNTear)) continue;
+                    Log("removido do totem: " + t.Name);
+                    UnityEngine.Object.Destroy(mb);
+                }
+                foreach (var r in go.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r == null) continue;
+                    string n = r.gameObject.name.ToLowerInvariant();
+                    if (n.Contains("bubble") || n.Contains("shield") || n.Contains("field") || n.Contains("area") || n.Contains("fx") || n.Contains("effect"))
+                    {
+                        Log("visual escondido: " + r.gameObject.name);
+                        r.gameObject.SetActive(false);
+                    }
+                }
+                go.AddComponent<ZNetView>();
+                go.AddComponent<TotemInteract>();
+                var piece = go.GetComponent<Piece>();
+                if (piece == null) { UnityEngine.Object.Destroy(go); return false; }
+                ItemDrop wood = zns.GetPrefab("FineWood")?.GetComponent<ItemDrop>();
+                ItemDrop core = zns.GetPrefab("SurtlingCore")?.GetComponent<ItemDrop>();
+                ItemDrop eye = zns.GetPrefab("GreydwarfEye")?.GetComponent<ItemDrop>();
+                ItemDrop coins = zns.GetPrefab("Coins")?.GetComponent<ItemDrop>();
+                var forge = zns.GetPrefab("forge")?.GetComponent<CraftingStation>();
+                piece.m_name = "Totem da Segunda Chance";
+                piece.m_description = "Quem morreu pode recuperar as habilidades perdidas (use com E).";
+                // NAO sobrescrever m_category: o martelo so mostra abas existentes;
+                // mantendo a categoria nativa da ward, o totem aparece na mesma aba dela.
+                // Uso fixo: a ward vem com todas as flags de uso (aparecia nas 18 abas
+                // e ninguem achava); Misc deixa num lugar unico (fallback sem Jotunn).
+                piece.m_usage = Piece.UsageTagFlags.Misc;
+                piece.m_enabled = true;
+                piece.m_canRotate = true;
+                piece.m_repairPiece = true;
+                piece.m_removePiece = true;
+                piece.m_canBeRemoved = true;
+                piece.m_craftingStation = forge;
+                piece.m_canRotate = true;
+                piece.m_repairPiece = true;
+                piece.m_removePiece = true;
+                piece.m_canBeRemoved = true;
+                piece.m_craftingStation = forge;
+                if (wood != null && core != null && eye != null && coins != null)
+                    piece.m_resources = new Piece.Requirement[]
+                    {
+                        new Piece.Requirement() { m_resItem = wood, m_amount = 30, m_recover = true },
+                        new Piece.Requirement() { m_resItem = core, m_amount = 5, m_recover = true },
+                        new Piece.Requirement() { m_resItem = eye, m_amount = 10, m_recover = true },
+                        new Piece.Requirement() { m_resItem = coins, m_amount = 500, m_recover = true },
+                    };
+                TryApplyCustomVisual(go);
+                zns.m_prefabs.Add(go);
+                _template = go;
+                Log("template ward ok (visual/icone/efeito da ward).");
+                return true;
+            }
+            catch (Exception e) { Log("ward falhou, usando primitivo: " + e.Message); return false; }
+        }
+
+        static void BuildPrimitive(ZNetScene zns)
+        {
+                GameObject root = new GameObject(PrefabName);
+                // CRITICO: desativar ANTES de AddComponent. Se o ZNetView acordar (Awake)
+                // com o objeto ativo, ele cria um ZDO vivo e registra em ZNetScene.m_instances;
+                // ao desativar depois, a view orfa (ZDO nulo) e ZNetScene.RemoveObjects
+                // quebra com NRE todo frame. Template tem que nascer morto.
+                root.SetActive(false);
+                Material stone = StealMaterial(false);
+                Material glow = StealMaterial(true);
+                if (stone == null || glow == null)
+                {
+                    if (_inst != null) _inst.Logger.LogError("[ViniTotem] nenhum material vanilla achado; adiando template.");
+                    UnityEngine.Object.Destroy(root);
+                    return;
+                }
+
+                var b = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                b.transform.SetParent(root.transform, false);
+                b.transform.localScale = new Vector3(1.9f, 0.6f, 1.9f);
+                b.transform.localPosition = new Vector3(0f, 0.3f, 0f);
+                b.GetComponent<MeshRenderer>().sharedMaterial = stone;
+
+                var col = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                col.transform.SetParent(root.transform, false);
+                col.transform.localScale = new Vector3(1.15f, 3.1f, 1.15f);
+                col.transform.localPosition = new Vector3(0f, 2.15f, 0f);
+                col.GetComponent<MeshRenderer>().sharedMaterial = stone;
+
+                var band = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                band.transform.SetParent(root.transform, false);
+                band.transform.localScale = new Vector3(1.22f, 0.28f, 1.22f);
+                band.transform.localPosition = new Vector3(0f, 2.9f, 0f);
+                band.GetComponent<MeshRenderer>().sharedMaterial = glow;
+                var bandCol = band.GetComponent<Collider>();
+                if (bandCol != null) UnityEngine.Object.Destroy(bandCol);
+
+                var cap = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                cap.transform.SetParent(root.transform, false);
+                cap.transform.localScale = new Vector3(1.35f, 0.35f, 1.35f);
+                cap.transform.localPosition = new Vector3(0f, 3.87f, 0f);
+                cap.GetComponent<MeshRenderer>().sharedMaterial = stone;
+
+                var box = root.AddComponent<BoxCollider>();
+                box.size = new Vector3(1.9f, 4.1f, 1.9f);
+                box.center = new Vector3(0f, 2.05f, 0f);
+                root.AddComponent<ZNetView>();
+                root.AddComponent<TotemInteract>();
+                SetupPiece(root);
+                TryApplyCustomVisual(root);
+                zns.m_prefabs.Add(root);
+                _template = root;
+                if (_inst != null) _inst.Logger.LogInfo("[ViniTotem] template primitivo ok.");
+        }
+
+        static void SetupPiece(GameObject root)
+        {
+            try
+            {
+                var zns = ZNetScene.instance;
+                ItemDrop wood = zns.GetPrefab("FineWood")?.GetComponent<ItemDrop>();
+                ItemDrop core = zns.GetPrefab("SurtlingCore")?.GetComponent<ItemDrop>();
+                ItemDrop eye = zns.GetPrefab("GreydwarfEye")?.GetComponent<ItemDrop>();
+                ItemDrop coins = zns.GetPrefab("Coins")?.GetComponent<ItemDrop>();
+                var forge = zns.GetPrefab("forge")?.GetComponent<CraftingStation>();
+                if (wood == null || core == null || eye == null || coins == null)
+                {
+                    if (_inst != null) _inst.Logger.LogError("[ViniTotem] itens de custo nao achados (wood/core/eye/coins).");
+                    return;
+                }
+                var piece = root.AddComponent<Piece>();
+                piece.m_name = "Totem da Segunda Chance";
+                piece.m_description = "Quem morreu pode recuperar as habilidades perdidas (use com E).";
+                piece.m_category = Piece.PieceCategory.Misc;
+                piece.m_enabled = true;
+                piece.m_canRotate = true;
+                piece.m_repairPiece = true;
+                piece.m_removePiece = true;
+                piece.m_canBeRemoved = true;
+                piece.m_craftingStation = forge;
+                Sprite icon = null;
+                foreach (var d in new ItemDrop[] { core, eye, coins, wood })
+                {
+                    try
+                    {
+                        if (d != null && d.m_itemData != null && d.m_itemData.m_shared != null
+                            && d.m_itemData.m_shared.m_icons != null && d.m_itemData.m_shared.m_icons.Length > 0
+                            && d.m_itemData.m_shared.m_icons[0] != null)
+                        { icon = d.m_itemData.m_shared.m_icons[0]; break; }
+                    }
+                    catch { }
+                }
+                piece.m_icon = icon;
+                piece.m_resources = new Piece.Requirement[]
+                {
+                    new Piece.Requirement() { m_resItem = wood, m_amount = 30, m_recover = true },
+                    new Piece.Requirement() { m_resItem = core, m_amount = 5, m_recover = true },
+                    new Piece.Requirement() { m_resItem = eye, m_amount = 10, m_recover = true },
+                    new Piece.Requirement() { m_resItem = coins, m_amount = 500, m_recover = true },
+                };
+                if (forge == null && _inst != null) _inst.Logger.LogWarning("[ViniTotem] forja nao achada; totem sem exigencia de estacao.");
+            }
+            catch (Exception e) { if (_inst != null) _inst.Logger.LogError("[ViniTotem] SetupPiece: " + e); }
+        }
+
+        static bool _swept = false;
+        static float _sweepAt = 0f;
+        static MethodInfo _miAddKnown;
+
+        void Update()
+        {
+            try
+            {
+                if (Input.GetKeyDown(KeyCode.F6)) DumpHammer();
+                if (_dialogOpen && Input.GetKeyDown(KeyCode.Escape)) _dialogOpen = false;
+                // Limpa totens-fantasma da versao bugada (template com ZNetView vivo).
+                // Nenhum totem legitimo existia antes desta versao, entao qualquer
+                // ViniSkillTotem na cena que nao seja o template registrado e lixo.
+                if (_swept) return;
+                if (Player.m_localPlayer == null || ZNetScene.instance == null) return;
+                if (_sweepAt == 0f) { _sweepAt = Time.time + 5f; return; }
+                if (Time.time < _sweepAt) return;
+                _swept = true;
+                SweepStrays();
+                UpgradePlacedTotems();
+            }
+            catch { }
+        }
+
+        static void SweepStrays()
+        {
+            try
+            {
+                int n = 0;
+                var all = GameObject.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                foreach (var go in all)
+                {
+                    if (go == null || go == _template) continue;
+                    if (go.name != PrefabName && go.name != PrefabName + "(Clone)") continue;
+                    if (ZNetScene.instance != null && ZNetScene.instance.m_prefabs.Contains(go)) continue;
+                    // So varre inativos + clones ativos perto da origem (onde o template bugado ficava).
+                    // Totem legitimo e colocado pelo jogador em outro lugar: preservado.
+                    bool nearOrigin = go.transform.position.sqrMagnitude < 2500f;
+                    if (go.activeInHierarchy && !nearOrigin) continue;
+                    var v = go.GetComponent<ZNetView>();
+                    if (v != null)
+                    {
+                        try
+                        {
+                            var zdo = v.GetZDO();
+                            if (zdo != null && ZDOMan.instance != null) ZDOMan.instance.DestroyZDO(zdo);
+                        }
+                        catch { }
+                    }
+                    UnityEngine.Object.Destroy(go);
+                    n++;
+                }
+                Log("varredura de fantasmas: " + n + " removidos.");
+            }
+            catch (Exception e) { Log("varredura falhou: " + e.Message); }
+        }
+
+        // Mantem TODAS as tabelas de martelo (vanilla + PlanBuild etc).
+        // O menu visivel pode ler uma tabela paralela (_PlanHammerPieceTable),
+        // que nunca passa por UpdateAvailable: injecao direta e necessaria.
+        static bool _planScanDone = false;
+        static bool _planScanCanTry = false;
+        static bool _planScanFailedOnce = false;
+        static bool _planCopyDone = false;
+
+        // Aplica visual+interacao tambem na copia "plan" do PlanBuild (e dela que
+        // saem os totens colocados via plano). Idempotente por sessao.
+        static void EnsurePlanCopyMods()
+        {
+            if (_planCopyDone) return;
+            try
+            {
+                System.Reflection.Assembly pb = null;
+                foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+                    if (a.GetName().Name == "PlanBuild") { pb = a; break; }
+                if (pb == null) { _planCopyDone = true; return; }
+                var pdbT = pb.GetType("PlanBuild.Plans.PlanDB");
+                if (pdbT == null) { _planCopyDone = true; return; }
+                object inst = null;
+                try
+                {
+                    var prop = pdbT.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    if (prop != null) inst = prop.GetValue(null, null);
+                    if (inst == null)
+                    {
+                        var fld = pdbT.GetField("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                        if (fld != null) inst = fld.GetValue(null);
+                    }
+                    if (inst == null)
+                        foreach (var o in Resources.FindObjectsOfTypeAll(pdbT)) { inst = o; break; }
+                }
+                catch { }
+                if (inst == null) return;
+                var mapF = pdbT.GetField("OriginalToPlanMap", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (mapF == null) { _planCopyDone = true; return; }
+                var map = mapF.GetValue(inst) as System.Collections.IDictionary;
+                if (map == null || !map.Contains(PrefabName)) return;
+                string planName = map[PrefabName] as string;
+                if (string.IsNullOrEmpty(planName)) { _planCopyDone = true; return; }
+                GameObject planPrefab = null;
+                try { planPrefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(planName) : null; } catch { }
+                if (planPrefab == null) return;
+                if (planPrefab.GetComponent<TotemInteract>() == null)
+                {
+                    try { planPrefab.AddComponent<TotemInteract>(); } catch { }
+                }
+                if (AttachCustomVisual(planPrefab, false)) Log("plan copy ok.");
+                _planCopyDone = true;
+            }
+            catch (Exception e) { Log("plan copy: " + e.Message); }
+        }
+        static bool _useJotunn = false;
+        static bool _jotunnRegistered = false;
+        static bool _jotunnReady = false;
+
+        // Tudo que toca na API do Jotunn fica isolado aqui: se o Jotunn nao
+        // estiver instalado, estes metodos nunca sao JITados/chamados.
+        static class JotunnBridge
+        {
+            public static void SubscribeVanillaPrefabs()
+            {
+                Jotunn.Managers.PrefabManager.OnVanillaPrefabsAvailable += OnVanilla;
+            }
+            static void OnVanilla()
+            {
+                try { Jotunn.Managers.PrefabManager.OnVanillaPrefabsAvailable -= OnVanilla; } catch { }
+                Register();
+            }
+            public static void Register()
+            {
+                if (ViniTotemPlugin._jotunnRegistered) return;
+                try
+                {
+                    if (Jotunn.Managers.PrefabManager.Instance.GetPrefab("ViniSkillTotem") != null)
+                    {
+                        ViniTotemPlugin._jotunnRegistered = true;
+                        return;
+                    }
+                    var cfg = new Jotunn.Configs.PieceConfig();
+                    cfg.Name = "Totem da Segunda Chance";
+                    cfg.Description = "Quem morreu pode recuperar as habilidades perdidas (use com E).";
+                    cfg.PieceTable = "Hammer";
+                    cfg.Usage = new string[] { "Misc", "Building" };
+                    cfg.CraftingStation = "forge";
+                    cfg.AddRequirement(new Jotunn.Configs.RequirementConfig() { Item = "FineWood", Amount = 30, Recover = true });
+                    cfg.AddRequirement(new Jotunn.Configs.RequirementConfig() { Item = "SurtlingCore", Amount = 5, Recover = true });
+                    cfg.AddRequirement(new Jotunn.Configs.RequirementConfig() { Item = "GreydwarfEye", Amount = 10, Recover = true });
+                    cfg.AddRequirement(new Jotunn.Configs.RequirementConfig() { Item = "Coins", Amount = 500, Recover = true });
+                    Jotunn.Managers.PieceManager.Instance.AddPiece(new Jotunn.Entities.CustomPiece("ViniSkillTotem", "guard_stone", cfg));
+                    ViniTotemPlugin._jotunnRegistered = true;
+                    ViniTotemPlugin.Log("totem registrado via Jotunn.");
+                }
+                catch (Exception e) { ViniTotemPlugin.Log("registro Jotunn falhou: " + e.Message); }
+            }
+            public static GameObject FetchTotem()
+            {
+                try { return Jotunn.Managers.PrefabManager.Instance.GetPrefab("ViniSkillTotem"); }
+                catch { return null; }
+            }
+        }
+
+        // Pede ao PlanBuild para reescanear as pecas (cria a versao "plan" do
+        // totem, que e a unica que o menu visivel mostra). So uma vez por sessao.
+        static void TriggerPlanRescan()
+        {
+            if (_planScanDone || !_planScanCanTry) return;
+            try
+            {
+                foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (a.GetName().Name != "PlanBuild") continue;
+                    var pdbType = a.GetType("PlanBuild.Plans.PlanDB");
+                    if (pdbType == null) { _planScanDone = true; return; }
+                    object inst = null;
+                    try
+                    {
+                        var prop = pdbType.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                        if (prop != null) inst = prop.GetValue(null, null);
+                        if (inst == null)
+                        {
+                            var fld = pdbType.GetField("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                            if (fld != null) inst = fld.GetValue(null);
+                        }
+                        if (inst == null)
+                            foreach (var o in Resources.FindObjectsOfTypeAll(pdbType)) { inst = o; break; }
+                    }
+                    catch { }
+                    if (inst == null) return; // PlanBuild ainda nao pronto; tenta depois
+                    var scan = pdbType.GetMethod("ScanPieceTables", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (scan == null) { _planScanDone = true; return; }
+                    scan.Invoke(inst, null);
+                    _planScanDone = true;
+                    Log("PlanBuild rescan solicitado.");
+                }
+            }
+            catch (Exception e)
+            {
+                if (_planScanFailedOnce) return;
+                _planScanFailedOnce = true;
+                string inner = e.InnerException != null ? (" <- " + e.InnerException.GetType().Name + ": " + e.InnerException.Message) : "";
+                Log("plan rescan falhou: " + e.GetType().Name + ": " + e.Message + inner);
+            }
+        }
+
+        public static void MaintainHammerTables()
+        {
+            try
+            {
+                EnsureTemplate();
+                if (_useJotunn && !_jotunnRegistered)
+                {
+                    try { JotunnBridge.Register(); } catch { }
+                }
+                var tables = Resources.FindObjectsOfTypeAll<PieceTable>();
+                foreach (var t in tables)
+                {
+                    if (t == null || t.gameObject == null) continue;
+                    if (!t.gameObject.name.Contains("Hammer")) continue;
+                    t.m_pieces.RemoveAll(g => g == null || (g != _template && g != null && g.name == PrefabName));
+                    t.m_enabledPieces.RemoveWhere(p => p == null || (p != null && p.gameObject != null && p.gameObject != _template && p.gameObject.name == PrefabName));
+                    t.m_availablePieces.RemoveWhere(p => p == null || (p != null && p.gameObject != null && p.gameObject != _template && p.gameObject.name == PrefabName));
+                    EnsureInHammerTable(t);
+                }
+                TriggerPlanRescan();
+                EnsurePlanCopyMods();
+            }
+            catch { }
+        }
+
+        public static void ScrubAllHammerTables()
+        {
+            MaintainHammerTables();
+        }
+
+        // Ensina a receita automaticamente no spawn (o jogo so mostra no martelo
+        // pecas conhecidas, e peca injetada tarde nunca e descoberta sozinha,
+        // a nao ser segurando todos os ingredientes de uma vez). Idempotente:
+        // AddKnownPiece so mostra o toast na primeira vez (com o icone da ward).
+        public static void TeachTotem(Player p)
+        {
+            try
+            {
+                if (p == null || p != Player.m_localPlayer || _miAddKnown == null) return;
+                EnsureTemplate();
+                if (_template == null) return;
+                var piece = _template.GetComponent<Piece>();
+                if (piece == null) return;
+                _miAddKnown.Invoke(p, new object[] { piece });
+            }
+            catch { }
+        }
+
+        public static void AllowPlanRescan() { _planScanCanTry = true; }
+
+        public static void OnWorldLoad()
+        {
+            _swept = false;
+            _sweepAt = 0f;
+            _planScanDone = false;
+            _planCopyDone = false;
+            try { EnsureTemplate(); }
+            catch { }
+            ScrubAllHammerTables();
+        }
+
+        // Raio-X da tabela do martelo (tecla F6 com o martelo aberto).
+        static void DumpHammer()
+        {
+            try
+            {
+                var p = Player.m_localPlayer;
+                // Caminho 1: Hud antiga (icones) = Player.GetBuildPieces()
+                try
+                {
+                    var gb = p != null ? p.GetBuildPieces() : null;
+                    bool has = false;
+                    if (gb != null)
+                        foreach (var pc in gb)
+                            if (pc != null && pc.m_name == "Totem da Segunda Chance") { has = true; break; }
+                    Log("GetBuildPieces n=" + (gb != null ? gb.Count : -1) + " temTotem=" + has);
+                }
+                catch (Exception e) { Log("gb falhou: " + e.Message); }
+                // Caminho 2: BuildUi nova via provedores IPieceList
+                try
+                {
+                    var hudType = typeof(Hud);
+                    var instProp = hudType.GetProperty("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    var hud = instProp != null ? instProp.GetValue(null, null) : null;
+                    var buiFld = hudType.GetField("m_buildUi", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var bui = (hud != null && buiFld != null) ? buiFld.GetValue(hud) : null;
+                    if (bui == null) { Log("buildUi nula"); }
+                    else
+                    {
+                        var comp = bui as Component;
+                        Log("buildUi ativa=" + (comp != null ? comp.gameObject.activeInHierarchy.ToString() : "?"));
+                        var listsFld = bui.GetType().GetField("m_pieceLists", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        var lists = listsFld != null ? listsFld.GetValue(bui) as System.Collections.IList : null;
+                        Log("pieceLists n=" + (lists != null ? lists.Count : -1));
+                        PieceTable hammer = null;
+                        foreach (var tt in Resources.FindObjectsOfTypeAll<PieceTable>())
+                            if (tt != null && tt.gameObject != null && tt.gameObject.name == "_HammerPieceTable") { hammer = tt; break; }
+                        if (lists != null && hammer != null)
+                            foreach (var lst in lists)
+                            {
+                                if (lst == null) continue;
+                                var lt = lst.GetType();
+                                string dn = "?";
+                                try { dn = (string)lt.GetProperty("DisplayName").GetValue(lst, null); } catch { }
+                                int tagCount = 0;
+                                try { tagCount = (int)lt.GetProperty("TagCount").GetValue(lst, null); } catch { }
+                                var getTag = lt.GetMethod("GetTagIdByIndex");
+                                var getAv = lt.GetMethod("GetAvailablePiecesWithTag");
+                                var tagName = lt.GetMethod("GetTagDisplayName");
+                                bool anyHas = false;
+                                int total = 0;
+                                for (int ti = 0; ti < tagCount; ti++)
+                                {
+                                    int tagId = (int)getTag.Invoke(lst, new object[] { ti });
+                                    var outList = new System.Collections.Generic.List<Piece>();
+                                    getAv.Invoke(lst, new object[] { tagId, hammer, outList });
+                                    total += outList.Count;
+                                    bool tagHas = false;
+                                    foreach (var pc in outList)
+                                        if (pc != null && pc.m_name == "Totem da Segunda Chance") { anyHas = true; tagHas = true; break; }
+                                    if (tagHas)
+                                    {
+                                        string tname = "?";
+                                        try { tname = (string)tagName.Invoke(lst, new object[] { tagId }); } catch { }
+                                        Log("  >>> TOTEM ESTA NA ABA: lista=" + lt.Name + " tag=" + tname + " (n=" + outList.Count + ")");
+                                    }
+                                }
+                                Log("lista " + lt.Name + " (" + dn + ") tags=" + tagCount + " pecas=" + total + " temTotem=" + anyHas);
+                            }
+                    }
+                }
+                catch (Exception e) { Log("bu falhou: " + e.Message); }
+                var tables = Resources.FindObjectsOfTypeAll<PieceTable>();
+                Log("tabelas achadas: " + tables.Length);
+                foreach (var t in tables)
+                {
+                    if (t == null || t.gameObject == null) continue;
+                    string tn = t.gameObject.name;
+                    if (!tn.Contains("Hammer")) continue;
+                    Log("tabela=" + tn + " pecas=" + t.m_pieces.Count + " cats=" + t.m_categories.Count);
+                    for (int i = 0; i < t.m_categories.Count && i < t.m_categoryLabels.Count; i++)
+                        Log("  aba " + i + "=" + t.m_categories[i].ToString() + " (" + t.m_categoryLabels[i] + ")");
+                    bool inPieces = false, inEn = false, inAv = false;
+                    Piece myPiece = null;
+                    int nulls = 0;
+                    foreach (var go in t.m_pieces)
+                    {
+                        if (go == null) { nulls++; continue; }
+                        var pc = go.GetComponent<Piece>();
+                        if (pc != null && pc.m_name == "Totem da Segunda Chance") { inPieces = true; myPiece = pc; }
+                    }
+                    foreach (var pc in t.m_enabledPieces)
+                        if (pc != null && pc.m_name == "Totem da Segunda Chance") inEn = true;
+                    foreach (var pc in t.m_availablePieces)
+                        if (pc != null && pc.m_name == "Totem da Segunda Chance") inAv = true;
+                    Log("totem: pieces=" + inPieces + " enabled=" + inEn + " available=" + inAv + " nulos=" + nulls);
+                    if (myPiece != null)
+                        Log("totem: cat=" + ((int)myPiece.m_category) + " enabledFlag=" + myPiece.m_enabled + " iconNull=" + (myPiece.m_icon == null));
+                    var f = typeof(Player).GetField("m_knownRecipes", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (f != null && p != null)
+                    {
+                        var known = f.GetValue(p) as System.Collections.Generic.HashSet<string>;
+                        Log("knownRecipes tem totem=" + (known != null && known.Contains("Totem da Segunda Chance")));
+                    }
+                    var byCat = typeof(PieceTable).GetField("m_availablePiecesByCategory", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (byCat != null)
+                    {
+                        var lists = byCat.GetValue(t) as System.Collections.Generic.List<System.Collections.Generic.List<Piece>>;
+                        if (lists != null)
+                            for (int i = 0; i < lists.Count; i++)
+                            {
+                                bool has = false;
+                                if (lists[i] != null)
+                                    foreach (var pc in lists[i])
+                                        if (pc != null && pc.m_name == "Totem da Segunda Chance") { has = true; break; }
+                                Log("  byCat[" + i + "] n=" + (lists[i] != null ? lists[i].Count : -1) + " temTotem=" + has);
+                            }
+                    }
+                }
+            }
+            catch (Exception e) { Log("dump falhou: " + e.Message); }
+        }
+
+        public static void Log(string s)
+        {
+            try { if (_inst != null) _inst.Logger.LogInfo("[ViniTotem] " + s); } catch { }
+        }
+
+        // ============ VISUAL CUSTOM (.glb) ============
+        static GameObject _customProto = null;
+
+        static GameObject GetCustomProto()
+        {
+            if (_customProto != null) return _customProto;
+            try
+            {
+                string cfg = _inst != null ? _inst._glbFile.Value : "tonzite_final.glb";
+                if (string.IsNullOrEmpty(cfg)) return null;
+                string path = cfg;
+                if (!Path.IsPathRooted(path))
+                    path = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), cfg);
+                if (!File.Exists(path)) return null;
+                Log("lendo glb: " + path);
+                var vis = LoadGlbVisual(path);
+                if (vis == null) return null;
+                vis.name = "TotemCustom";
+                vis.SetActive(false);
+                _customProto = vis;
+                Log("visual custom pronto (" + Path.GetFileName(path) + ").");
+                return vis;
+            }
+            catch (Exception e) { Log("visual custom falhou: " + e.ToString()); return null; }
+        }
+
+        static bool HasCustomChild(GameObject root)
+        {
+            try
+            {
+                foreach (Transform c in root.transform)
+                    if (c != null && c.name.StartsWith("TotemCustom")) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        static bool IsUnderCustom(Transform t)
+        {
+            try
+            {
+                while (t != null)
+                {
+                    if (t.name.StartsWith("TotemCustom")) return true;
+                    t = t.parent;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static bool AttachCustomVisual(GameObject root, bool setIcon)
+        {
+            var proto = GetCustomProto();
+            if (proto == null) return false;
+            // Mata tudo da ward (luz, particulas, meshes) fora do custom, sempre
+            // (cobre tambem totens ja atualizados antes deste fix).
+            foreach (var l in root.GetComponentsInChildren<Light>(true))
+                try { if (l != null && !IsUnderCustom(l.transform)) l.enabled = false; } catch { }
+            foreach (var ps in root.GetComponentsInChildren<ParticleSystem>(true))
+                try { if (ps != null && !IsUnderCustom(ps.transform)) ps.gameObject.SetActive(false); } catch { }
+            foreach (var r in root.GetComponentsInChildren<MeshRenderer>(true))
+                try { if (r != null && !IsUnderCustom(r.transform)) r.gameObject.SetActive(false); } catch { }
+            if (!HasCustomChild(root))
+            {
+                var inst = UnityEngine.Object.Instantiate(proto);
+                inst.name = "TotemCustom";
+                inst.transform.SetParent(root.transform, false);
+                inst.transform.localPosition = Vector3.zero;
+                inst.SetActive(true);
+            }
+            // Troca colisores da ward por um box ajustado (senao nao da pra
+            // mirar/interagir e atravessa o relevo).
+            try
+            {
+                foreach (var c in root.GetComponentsInChildren<Collider>(true))
+                    try { if (c != null && !IsUnderCustom(c.transform)) UnityEngine.Object.Destroy(c); } catch { }
+                Mesh useMesh = null;
+                foreach (Transform ch in root.transform)
+                    if (ch != null && ch.name.StartsWith("TotemCustom"))
+                    {
+                        var mff = ch.GetComponent<MeshFilter>();
+                        if (mff != null) useMesh = mff.sharedMesh;
+                    }
+                if (useMesh != null)
+                {
+                    var box = root.GetComponent<BoxCollider>();
+                    if (box == null) box = root.AddComponent<BoxCollider>();
+                    var b = useMesh.bounds;
+                    box.size = b.size + new Vector3(0.4f, 0.2f, 0.4f);
+                    box.center = b.center;
+                }
+            }
+            catch { }
+            if (setIcon)
+            {
+                MeshRenderer rend = null;
+                foreach (Transform ch in root.transform)
+                    if (ch != null && ch.name.StartsWith("TotemCustom"))
+                    {
+                        rend = ch.GetComponent<MeshRenderer>();
+                        break;
+                    }
+                var piece = root.GetComponent<Piece>();
+                if (piece != null && rend != null && rend.sharedMaterial != null)
+                {
+                    var tex = rend.sharedMaterial.mainTexture as Texture2D;
+                    if (tex != null)
+                    {
+                        try { piece.m_icon = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height), new Vector2(0.5f, 0.5f)); }
+                        catch { }
+                    }
+                }
+            }
+            return true;
+        }
+
+        static bool TryApplyCustomVisual(GameObject root)
+        {
+            try
+            {
+                if (AttachCustomVisual(root, true)) { Log("visual custom aplicado."); return true; }
+                return false;
+            }
+            catch (Exception e) { Log("visual custom falhou: " + e.ToString()); return false; }
+        }
+
+        // Totens colocados antes do visual custom existiam so com corpo de ward:
+        // troca o visual deles ao entrar no mundo (so visual local, por cliente).
+        static void UpgradePlacedTotems()
+        {
+            try
+            {
+                if (GetCustomProto() == null) return;
+                int n = 0;
+                var all = GameObject.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                foreach (var go in all)
+                {
+                    if (go == null || go == _template) continue;
+                    if (!go.activeInHierarchy) continue;
+                    if (go.name != PrefabName + "(Clone)") continue;
+                    if (ZNetScene.instance != null && ZNetScene.instance.m_prefabs.Contains(go)) continue;
+                    if (HasCustomChild(go)) continue;
+                    if (AttachCustomVisual(go, false)) n++;
+                }
+                if (n > 0) Log("totens antigos atualizados: " + n);
+            }
+            catch (Exception e) { Log("upgrade colocados falhou: " + e.Message); }
+        }
+
+        static GameObject LoadGlbVisual(string path)
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            if (bytes.Length < 20 || Encoding.ASCII.GetString(bytes, 0, 4) != "glTF") { Log("nao e glb valido."); return null; }
+            int jsonLen = BitConverter.ToInt32(bytes, 12);
+            string ctype = Encoding.ASCII.GetString(bytes, 16, 4);
+            if (ctype != "JSON") { Log("chunk JSON nao achado."); return null; }
+            string json = Encoding.UTF8.GetString(bytes, 20, jsonLen);
+            int binPos = 20 + jsonLen;
+            int binStart = binPos + 8;
+            var root = MiniJson.Parse(json) as Dictionary<string, object>;
+            if (root == null) return null;
+            var scenes = (List<object>)root["scenes"];
+            var scene = (Dictionary<string, object>)scenes[Convert.ToInt32((double)root["scene"])];
+            var sceneNodes = (List<object>)scene["nodes"];
+            var nodes = (List<object>)root["nodes"];
+            var node = FindMeshNode(nodes, sceneNodes);
+            if (node == null) { Log("glb sem mesh."); return null; }
+            float nsx = 1f, nsy = 1f, nsz = 1f, ntx = 0f, nty = 0f, ntz = 0f;
+            if (node.ContainsKey("scale")) { var scl = (List<object>)node["scale"]; nsx = (float)(double)scl[0]; nsy = (float)(double)scl[1]; nsz = (float)(double)scl[2]; }
+            if (node.ContainsKey("translation")) { var trl = (List<object>)node["translation"]; ntx = (float)(double)trl[0]; nty = (float)(double)trl[1]; ntz = (float)(double)trl[2]; }
+            var meshes = (List<object>)root["meshes"];
+            var meshDef = (Dictionary<string, object>)meshes[Convert.ToInt32((double)node["mesh"])];
+            var prims = (List<object>)meshDef["primitives"];
+            var prim = (Dictionary<string, object>)prims[0];
+            var attrs = (Dictionary<string, object>)prim["attributes"];
+            var accessors = (List<object>)root["accessors"];
+            var bufferViews = (List<object>)root["bufferViews"];
+            float[] pos = ReadAccFloats(bytes, binStart, accessors, bufferViews, Convert.ToInt32((double)attrs["POSITION"]));
+            float[] nor = ReadAccFloats(bytes, binStart, accessors, bufferViews, Convert.ToInt32((double)attrs["NORMAL"]));
+            float[] uv = ReadAccFloats(bytes, binStart, accessors, bufferViews, Convert.ToInt32((double)attrs["TEXCOORD_0"]));
+            int[] idx = ReadAccIndices(bytes, binStart, accessors, bufferViews, Convert.ToInt32((double)prim["indices"]));
+            int vc = pos.Length / 3;
+            // uv transform (KHR_texture_transform da baseColor)
+            float usx = 1f, usy = 1f, uox = 0f, uoy = 0f;
+            try
+            {
+                var mats = (List<object>)root["materials"];
+                var mat0 = (Dictionary<string, object>)mats[Convert.ToInt32((double)prim["material"])];
+                var pbr = (Dictionary<string, object>)mat0["pbrMetallicRoughness"];
+                var bct = (Dictionary<string, object>)pbr["baseColorTexture"];
+                var ext = (Dictionary<string, object>)bct["extensions"];
+                var khr = (Dictionary<string, object>)ext["KHR_texture_transform"];
+                var sc = (List<object>)khr["scale"]; usx = (float)(double)sc[0]; usy = (float)(double)sc[1];
+                var off = (List<object>)khr["offset"]; uox = (float)(double)off[0]; uoy = (float)(double)off[1];
+            }
+            catch { }
+            // textura baseColor
+            Texture2D albedo = null;
+            try
+            {
+                var mats = (List<object>)root["materials"];
+                var mat0 = (Dictionary<string, object>)mats[Convert.ToInt32((double)prim["material"])];
+                var pbr = (Dictionary<string, object>)mat0["pbrMetallicRoughness"];
+                var bct = (Dictionary<string, object>)pbr["baseColorTexture"];
+                var textures = (List<object>)root["textures"];
+                var tex = (Dictionary<string, object>)textures[Convert.ToInt32((double)bct["index"])];
+                var images = (List<object>)root["images"];
+                var img = (Dictionary<string, object>)images[Convert.ToInt32((double)tex["source"])];
+                string mime = img.ContainsKey("mimeType") ? (string)img["mimeType"] : "";
+                Log("albedo: texIdx=" + bct["index"] + " img=" + (img.ContainsKey("name") ? img["name"] : "?") + " " + mime);
+                if (mime == "image/png" || mime == "image/jpeg")
+                {
+                    var bv = (Dictionary<string, object>)bufferViews[Convert.ToInt32((double)img["bufferView"])];
+                    int off = binStart + Convert.ToInt32((double)bv["byteOffset"]);
+                    int len = Convert.ToInt32((double)bv["byteLength"]);
+                    byte[] png = new byte[len];
+                    Buffer.BlockCopy(bytes, off, png, 0, len);
+                    albedo = new Texture2D(2, 2);
+                    if (!albedo.LoadImage(png)) { Log("LoadImage falhou."); return null; }
+                    albedo.wrapMode = TextureWrapMode.Repeat;
+                    albedo.filterMode = FilterMode.Trilinear;
+                    albedo.anisoLevel = 4;
+                    try
+                    {
+                        var px = albedo.GetPixels();
+                        for (int i = 0; i < px.Length; i++)
+                        {
+                            px[i].r = Mathf.Min(1f, px[i].r * 1.7f);
+                            px[i].g = Mathf.Min(1f, px[i].g * 1.7f);
+                            px[i].b = Mathf.Min(1f, px[i].b * 1.7f);
+                        }
+                        albedo.SetPixels(px);
+                        albedo.Apply(false);
+                    }
+                    catch (Exception e) { Log("brilho falhou: " + e.Message); }
+                }
+                else Log("textura nao suportada: " + mime);
+            }
+            catch (Exception e) { Log("textura glb falhou: " + e.Message); }
+            if (albedo == null) return null;
+            // monta vertices (node TRS + auto-ajuste p/ 2.4m de altura, base no chao)
+            float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+            float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+            Vector3[] verts = new Vector3[vc];
+            for (int i = 0; i < vc; i++)
+            {
+                float x = pos[i * 3] * nsx + ntx, y = pos[i * 3 + 1] * nsy + nty, z = pos[i * 3 + 2] * nsz + ntz;
+                verts[i] = new Vector3(x, y, z);
+                if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+                if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+            }
+            float h = Mathf.Max(0.001f, maxY - minY);
+            float s = 2.4f / h;
+            float cx = (minX + maxX) * 0.5f, cz = (minZ + maxZ) * 0.5f;
+            Vector3[] nors = new Vector3[vc];
+            Vector2[] uvs = new Vector2[vc];
+            for (int i = 0; i < vc; i++)
+            {
+                verts[i] = new Vector3((verts[i].x - cx) * s, (verts[i].y - minY) * s, (verts[i].z - cz) * s);
+                nors[i] = new Vector3(nor[i * 3], nor[i * 3 + 1], nor[i * 3 + 2]).normalized;
+                uvs[i] = new Vector2(uv[i * 2] * usx + uox, uv[i * 2 + 1] * usy + uoy);
+            }
+            int[] tris = new int[idx.Length];
+            // Sem flip: o enrolamento CCW do glTF ja aparece correto no Unity
+            // (com flip ficava visivel so por tras). Cull off cobre o resto.
+            for (int i = 0; i < idx.Length; i++) tris[i] = idx[i];
+            var umesh = new Mesh();
+            umesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            umesh.vertices = verts;
+            umesh.normals = nors;
+            umesh.uv = uvs;
+            umesh.triangles = tris;
+            umesh.RecalculateBounds();
+            var baseMat = StealMaterial(false, true);
+            if (baseMat == null) { Log("sem material vanilla."); return null; }
+            Log("mat base: shader=" + (baseMat.shader != null ? baseMat.shader.name : "?")
+                + " fila=" + baseMat.renderQueue
+                + " temMainTex=" + baseMat.HasProperty("_MainTex")
+                + " temColor=" + baseMat.HasProperty("_Color")
+                + " temMetal=" + baseMat.HasProperty("_Metallic"));
+            if (baseMat.HasProperty("_Metallic"))
+            {
+                try { baseMat.SetFloat("_Metallic", 0f); } catch { }
+                try { baseMat.SetFloat("_Glossiness", 0.4f); } catch { }
+            }
+            // Forca opaco: material roubado pode ser transparente (fantasma).
+            try
+            {
+                baseMat.SetFloat("_Mode", 0f);
+                baseMat.SetInt("_SrcBlend", 1);
+                baseMat.SetInt("_DstBlend", 0);
+                baseMat.SetInt("_ZWrite", 1);
+                baseMat.DisableKeyword("_ALPHATEST_ON");
+                baseMat.DisableKeyword("_ALPHABLEND_ON");
+                baseMat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+                baseMat.renderQueue = -1;
+            }
+            catch { }
+            if (baseMat.HasProperty("_Color")) baseMat.color = Color.black;
+            if (baseMat.HasProperty("_MainTex")) baseMat.mainTexture = albedo;
+            try
+            {
+                if (baseMat.HasProperty("_EmissionMap")) baseMat.SetTexture("_EmissionMap", albedo);
+                if (baseMat.HasProperty("_EmissionColor")) baseMat.SetColor("_EmissionColor", new Color(1f, 1f, 1f));
+                baseMat.EnableKeyword("_EMISSION");
+            }
+            catch { }
+            try { baseMat.SetInt("_Cull", 0); } catch { }
+            var go = new GameObject("TotemCustom");
+            go.AddComponent<MeshFilter>().sharedMesh = umesh;
+            go.AddComponent<MeshRenderer>().sharedMaterial = baseMat;
+            return go;
+        }
+
+        static int BvStart(int binStart, List<object> bufferViews, int idx)
+        {
+            var bv = (Dictionary<string, object>)bufferViews[idx];
+            int off = bv.ContainsKey("byteOffset") ? Convert.ToInt32((double)bv["byteOffset"]) : 0;
+            return binStart + off;
+        }
+
+        static float[] ReadAccFloats(byte[] bytes, int binStart, List<object> accessors, List<object> bufferViews, int idx)
+        {
+            var acc = (Dictionary<string, object>)accessors[idx];
+            int comp = Convert.ToInt32((double)acc["componentType"]);
+            int count = Convert.ToInt32((double)acc["count"]);
+            string type = (string)acc["type"];
+            int comps = type == "VEC3" ? 3 : (type == "VEC2" ? 2 : 1);
+            int bv = Convert.ToInt32((double)acc["bufferView"]);
+            int ab = acc.ContainsKey("byteOffset") ? Convert.ToInt32((double)acc["byteOffset"]) : 0;
+            int start = BvStart(binStart, bufferViews, bv) + ab;
+            int sz = comp == 5126 ? 4 : (comp == 5123 ? 2 : 1);
+            float[] o = new float[count * comps];
+            for (int i = 0; i < count * comps; i++)
+            {
+                int p = start + i * sz;
+                if (comp == 5126) o[i] = BitConverter.ToSingle(bytes, p);
+                else if (comp == 5123) o[i] = BitConverter.ToUInt16(bytes, p) / 65535f;
+                else if (comp == 5121) o[i] = bytes[p] / 255f;
+                else if (comp == 5120) o[i] = ((sbyte)bytes[p]) / 127f;
+                else throw new Exception("componentType " + comp);
+            }
+            return o;
+        }
+
+        static int[] ReadAccIndices(byte[] bytes, int binStart, List<object> accessors, List<object> bufferViews, int idx)
+        {
+            var acc = (Dictionary<string, object>)accessors[idx];
+            int comp = Convert.ToInt32((double)acc["componentType"]);
+            int count = Convert.ToInt32((double)acc["count"]);
+            int bv = Convert.ToInt32((double)acc["bufferView"]);
+            int ab = acc.ContainsKey("byteOffset") ? Convert.ToInt32((double)acc["byteOffset"]) : 0;
+            int start = BvStart(binStart, bufferViews, bv) + ab;
+            int[] o = new int[count];
+            for (int i = 0; i < count; i++)
+            {
+                if (comp == 5125) o[i] = (int)BitConverter.ToUInt32(bytes, start + i * 4);
+                else if (comp == 5123) o[i] = BitConverter.ToUInt16(bytes, start + i * 2);
+                else throw new Exception("indice type " + comp);
+            }
+            return o;
+        }
+
+        static Dictionary<string, object> FindMeshNode(List<object> nodes, List<object> roots)
+        {
+            foreach (var r in roots)
+            {
+                var n = (Dictionary<string, object>)nodes[Convert.ToInt32((double)r)];
+                if (n.ContainsKey("mesh")) return n;
+                if (n.ContainsKey("children"))
+                {
+                    var c = FindMeshNode(nodes, (List<object>)n["children"]);
+                    if (c != null) return c;
+                }
+            }
+            return null;
+        }
+
+        static class MiniJson
+        {
+            public static object Parse(string s) { int i = 0; Skip(s, ref i); var v = Val(s, ref i); return v; }
+            static void Skip(string s, ref int i) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+            static object Val(string s, ref int i)
+            {
+                Skip(s, ref i);
+                char c = s[i];
+                if (c == '{')
+                {
+                    i++;
+                    var d = new Dictionary<string, object>();
+                    Skip(s, ref i);
+                    if (s[i] == '}') { i++; return d; }
+                    while (true)
+                    {
+                        Skip(s, ref i);
+                        string k = Str(s, ref i);
+                        Skip(s, ref i); i++;
+                        d[k] = Val(s, ref i);
+                        Skip(s, ref i);
+                        if (s[i] == ',') { i++; continue; }
+                        if (s[i] == '}') { i++; break; }
+                        throw new Exception("json objeto");
+                    }
+                    return d;
+                }
+                if (c == '[')
+                {
+                    i++;
+                    var l = new List<object>();
+                    Skip(s, ref i);
+                    if (s[i] == ']') { i++; return l; }
+                    while (true)
+                    {
+                        l.Add(Val(s, ref i));
+                        Skip(s, ref i);
+                        if (s[i] == ',') { i++; continue; }
+                        if (s[i] == ']') { i++; break; }
+                        throw new Exception("json lista");
+                    }
+                    return l;
+                }
+                if (c == '"') return Str(s, ref i);
+                if (c == 't') { i += 4; return true; }
+                if (c == 'f') { i += 5; return false; }
+                if (c == 'n') { i += 4; return null; }
+                int st = i;
+                while (i < s.Length && "-+0123456789.eE".IndexOf(s[i]) >= 0) i++;
+                string tok = s.Substring(st, i - st);
+                try { return double.Parse(tok, CultureInfo.InvariantCulture); }
+                catch { throw new Exception("num [" + tok + "]"); }
+            }
+            static string Str(string s, ref int i)
+            {
+                i++;
+                var sb = new StringBuilder();
+                while (true)
+                {
+                    char c = s[i++];
+                    if (c == '"') break;
+                    if (c == '\\')
+                    {
+                        char e = s[i++];
+                        if (e == 'u') { sb.Append((char)Convert.ToInt32(s.Substring(i, 4), 16)); i += 4; }
+                        else if (e == 'n') sb.Append('\n');
+                        else if (e == 't') sb.Append('\t');
+                        else sb.Append(e);
+                    }
+                    else sb.Append(c);
+                }
+                return sb.ToString();
+            }
+        }
+
+        public static void OpenDialog(Vector3 pos)
+        {
+            _dialogOpen = true;
+            _dialogPos = pos;
+        }
+
+        // ============ JANELA 10 MIN (protecao do jogo) ============
+        static void WindowInfo(Player p, out bool inWindow, out float left)
+        {
+            inWindow = false; left = 0f;
+            if (p == null) return;
+            try
+            {
+                if (_fSince != null && _fCool != null)
+                {
+                    float since = (float)_fSince.GetValue(p);
+                    float cool = (float)_fCool.GetValue(p);
+                    if (cool <= 0f) cool = 600f;
+                    inWindow = since < cool;
+                    left = Mathf.Max(0f, cool - since);
+                    return;
+                }
+            }
+            catch { }
+            left = Mathf.Max(0f, 600f - (Time.time - LastDeathTime));
+            inWindow = left > 0f;
+        }
+
+        static float LostTotal()
+        {
+            float t = 0f;
+            foreach (var kv in Lost) t += kv.Value;
+            return t;
+        }
+
+        static int CountCoins(Player p)
+        {
+            int n = 0;
+            try
+            {
+                var inv = p.GetInventory();
+                if (inv == null) return 0;
+                foreach (var it in inv.GetAllItems())
+                    if (it != null && it.m_shared != null && it.m_shared.m_name == CoinName)
+                        n += it.m_stack;
+            }
+            catch { }
+            return n;
+        }
+
+        static void RemoveCoins(Player p, int amount)
+        {
+            var inv = p.GetInventory();
+            if (inv == null) return;
+            int need = amount;
+            // GetAllItems retorna a lista VIVA do inventario: copiar antes,
+            // senao o foreach quebra (InvalidOperation) na primeira remocao.
+            var stacks = new List<ItemDrop.ItemData>(inv.GetAllItems());
+            foreach (var it in stacks)
+            {
+                if (need <= 0) break;
+                if (it != null && it.m_shared != null && it.m_shared.m_name == CoinName && it.m_stack > 0)
+                {
+                    int take = Math.Min(it.m_stack, need);
+                    if (inv.RemoveItem(it, take)) need -= take;
+                }
+            }
+            if (need > 0) Log("aviso: faltaram " + need + " moedas na cobranca!");
+        }
+
+        static void BuyRestore(Player p)
+        {
+            int price = _inst != null ? _inst._price.Value : 3000;
+            if (CountCoins(p) < price || Lost.Count == 0 || Claimed) return;
+            float total = 0f;
+            try
+            {
+                var sk = p.GetComponent<Skills>();
+                if (sk != null)
+                    foreach (var kv in new Dictionary<Skills.SkillType, float>(Lost))
+                    {
+                        sk.CheatRaiseSkill(kv.Key.ToString(), kv.Value, false);
+                        total += kv.Value;
+                    }
+            }
+            catch (Exception e) { Log("restore falhou: " + e.Message); return; }
+            // So cobra DEPOIS de restaurar (se falhar, nao come moeda a toa).
+            RemoveCoins(p, price);
+            Lost.Clear();
+            Claimed = true;
+            RestoredTotal = total;
+            p.Message(MessageHud.MessageType.TopLeft, "Habilidades restauradas pelo totem! (" + total.ToString("F1") + " niveis)");
+        }
+
+        static string Clean(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            string n = s.Normalize(NormalizationForm.FormD);
+            var sb = new StringBuilder(n.Length);
+            foreach (char c in n)
+                if (CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+                    sb.Append(c);
+            return sb.ToString().Normalize(NormalizationForm.FormC);
+        }
+
+        static string SkillName(Skills.SkillType t, Skills sk)
+        {
+            try
+            {
+                foreach (var s in sk.GetSkillList())
+                    if (s != null && s.m_info != null && s.m_info.m_skill == t && !string.IsNullOrEmpty(s.m_info.m_description))
+                        return Clean(Localization.instance.Localize(s.m_info.m_description));
+            }
+            catch { }
+            return Clean(t.ToString());
+        }
+
+        // ============ DIALOGO (padrao ViniUI do ViniFarm) ============
+        void OnGUI()
+        {
+            if (!_dialogOpen) return;
+            try
+            {
+                var p = Player.m_localPlayer;
+                if (p == null || p.IsDead()) { _dialogOpen = false; return; }
+                if (Vector3.Distance(p.transform.position, _dialogPos) > 9f) { _dialogOpen = false; return; }
+                ViniUI.Ensure();
+                float w = 460f, h = 500f;
+                Rect r = new Rect((Screen.width - w) / 2f, (Screen.height - h) / 2f, w, h);
+                Color oldBg = GUI.backgroundColor;
+                GUI.backgroundColor = ViniUI.PanelBg;
+                r = GUI.ModalWindow(1337042, r, DrawDialog, "", ViniUI.WindowStyle());
+                GUI.backgroundColor = oldBg;
+                ViniUI.Border(r);
+            }
+            catch (Exception e) { Logger.LogError("[ViniTotem] OnGUI: " + e); _dialogOpen = false; }
+        }
+
+        void DrawDialog(int id)
+        {
+            try
+            {
+                var p = Player.m_localPlayer;
+                if (p == null) return;
+                GUILayout.Label("TOTEM DA SEGUNDA CHANCE", ViniUI.Title());
+                GUILayout.Label("por viniwalkersp", ViniUI.Sub());
+                GUILayout.Space(6);
+
+                var sk = p.GetComponent<Skills>();
+                bool inWin; float left;
+                WindowInfo(p, out inWin, out left);
+                float total = LostTotal();
+                int coins = CountCoins(p);
+                int price = _price.Value;
+
+                if (Claimed && Lost.Count == 0)
+                {
+                    GUILayout.Label("Habilidades restauradas! (" + RestoredTotal.ToString("F1") + " niveis)", ViniUI.Center());
+                    GUILayout.Space(4);
+                    GUILayout.Label("Boa sorte, guerreiro. Nao morra de novo.", ViniUI.Center());
+                }
+                else if (Lost.Count == 0 || total < 0.05f)
+                {
+                    GUILayout.Label("Nenhuma perda recente registrada.", ViniUI.Center());
+                    GUILayout.Space(4);
+                    GUILayout.Label("Se voce morrer, volte a este totem em ate 10 min para recuperar seus niveis.", ViniUI.Center());
+                }
+                else if (!inWin)
+                {
+                    GUILayout.Label("A protecao de 10 min acabou.", ViniUI.Center());
+                    GUILayout.Space(4);
+                    GUILayout.Label("A perda desta morte nao pode mais ser recuperada.", ViniUI.Center());
+                }
+                else
+                {
+                    int mm = (int)(left / 60f), ss = (int)(left % 60f);
+                    GUILayout.Label("Voce perdeu " + total.ToString("F1") + " niveis. Tempo restante: " + mm + ":" + ss.ToString("D2"), ViniUI.Center());
+                    GUILayout.Space(4);
+                    _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.Height(220));
+                    foreach (var kv in Lost)
+                    {
+                        float cur = sk != null ? sk.GetSkillLevel(kv.Key) : 0f;
+                        GUILayout.Label("- " + SkillName(kv.Key, sk) + ": " + cur.ToString("F1") + " (-" + kv.Value.ToString("F1") + ")", ViniUI.Center());
+                    }
+                    GUILayout.EndScrollView();
+                    GUILayout.Space(4);
+                    GUILayout.Label("Moedas: " + coins + " / " + price, ViniUI.Center());
+                    GUILayout.Space(4);
+                    GUI.enabled = coins >= price;
+                    Color oldBg = GUI.backgroundColor;
+                    GUI.backgroundColor = new Color(0.17f, 0.44f, 0.19f);
+                    if (GUILayout.Button("Recuperar (-" + price + " moedas)", ViniUI.Big(), GUILayout.Height(36))) BuyRestore(p);
+                    GUI.backgroundColor = oldBg;
+                    GUI.enabled = true;
+                    if (coins < price) GUILayout.Label("Moedas insuficientes!", ViniUI.Center());
+                }
+                GUILayout.Space(8);
+                Color bg2 = GUI.backgroundColor;
+                GUI.backgroundColor = new Color(0.15f, 0.12f, 0.085f);
+                if (GUILayout.Button("Fechar", ViniUI.Btn(), GUILayout.Height(30))) _dialogOpen = false;
+                GUI.backgroundColor = bg2;
+            }
+            catch (Exception e) { Log("dialogo falhou: " + e.Message); _dialogOpen = false; }
+        }
+
+        // ============ ViniUI (mesmo padrao do ViniFarm) ============
+        static class ViniUI
+        {
+            public static readonly Color PanelBg = new Color(0.10f, 0.078f, 0.055f, 0.97f);
+            public static readonly Color TitleGold = new Color(1f, 0.84f, 0.42f);
+            public static readonly Color Text = new Color(0.93f, 0.89f, 0.80f);
+            public static readonly Color Muted = new Color(0.62f, 0.58f, 0.51f);
+            public static readonly Color GoldDim = new Color(0.55f, 0.42f, 0.20f);
+            static Texture2D _white;
+            static Font _norse;
+            static GUIStyle s_window, s_title, s_sub, s_center, s_big, s_btn, s_flat;
+            static Texture2D White()
+            {
+                if (_white == null) { _white = new Texture2D(1, 1); _white.SetPixel(0, 0, Color.white); _white.Apply(); }
+                return _white;
+            }
+            static Font Norse()
+            {
+                if (_norse != null) return _norse;
+                try
+                {
+                    foreach (var o in Resources.FindObjectsOfTypeAll(typeof(Font)))
+                    {
+                        var f = o as Font;
+                        if (f != null && f.name != null && f.name.IndexOf("Norse", StringComparison.OrdinalIgnoreCase) >= 0) { _norse = f; break; }
+                    }
+                }
+                catch { }
+                return _norse;
+            }
+            public static void Ensure()
+            {
+                if (s_window != null) return;
+                Font tf = Norse();
+                s_flat = new GUIStyle();
+                s_flat.normal.background = White();
+                s_window = new GUIStyle();
+                s_window.normal.background = White();
+                s_window.padding = new RectOffset(14, 14, 8, 12);
+                s_title = new GUIStyle(GUI.skin.label);
+                s_title.fontSize = 24; s_title.fontStyle = FontStyle.Bold;
+                s_title.alignment = TextAnchor.MiddleCenter;
+                s_title.normal.textColor = TitleGold;
+                if (tf != null) s_title.font = tf;
+                s_sub = new GUIStyle(GUI.skin.label);
+                s_sub.fontSize = 10; s_sub.alignment = TextAnchor.MiddleCenter;
+                s_sub.normal.textColor = Muted;
+                s_center = new GUIStyle(GUI.skin.label);
+                s_center.fontSize = 12; s_center.alignment = TextAnchor.MiddleCenter;
+                s_center.normal.textColor = Text;
+                s_center.wordWrap = true;
+                s_big = new GUIStyle(GUI.skin.button);
+                s_big.fontSize = 15; s_big.fontStyle = FontStyle.Bold;
+                s_big.alignment = TextAnchor.MiddleCenter;
+                s_big.normal.textColor = Color.white; s_big.hover.textColor = Color.white; s_big.active.textColor = Color.white;
+                s_big.normal.background = White(); s_big.hover.background = White();
+                s_big.active.background = White(); s_big.focused.background = White();
+                s_btn = new GUIStyle(GUI.skin.button);
+                s_btn.fontSize = 12;
+                s_btn.normal.textColor = Text;
+                s_btn.normal.background = White(); s_btn.hover.background = White();
+                s_btn.active.background = White(); s_btn.focused.background = White();
+            }
+            public static GUIStyle WindowStyle() { Ensure(); return s_window; }
+            public static GUIStyle Title() { Ensure(); return s_title; }
+            public static GUIStyle Sub() { Ensure(); return s_sub; }
+            public static GUIStyle Center() { Ensure(); return s_center; }
+            public static GUIStyle Big() { Ensure(); return s_big; }
+            public static GUIStyle Btn() { Ensure(); return s_btn; }
+            public static void Border(Rect r)
+            {
+                Ensure();
+                Color oldBg = GUI.backgroundColor;
+                GUI.backgroundColor = GoldDim;
+                GUI.Box(new Rect(r.x, r.y, r.width, 1), "", s_flat);
+                GUI.Box(new Rect(r.x, r.yMax - 1, r.width, 1), "", s_flat);
+                GUI.Box(new Rect(r.x, r.y, 1, r.height), "", s_flat);
+                GUI.Box(new Rect(r.xMax - 1, r.y, 1, r.height), "", s_flat);
+                GUI.backgroundColor = oldBg;
+            }
+        }
+    }
+
+    public class TotemInteract : MonoBehaviour, Hoverable, Interactable
+    {
+        public string GetHoverName() { return "Totem da Segunda Chance"; }
+        public string GetHoverText()
+        {
+            return Localization.instance.Localize(GetHoverName() + "\n[<color=yellow><b>$KEY_Use</b></color>] Recuperar habilidades");
+        }
+        public float GetHoverOffset() { return 2.5f; }
+        public bool Interact(Humanoid user, bool hold, bool alt)
+        {
+            if (hold || alt) return false;
+            try
+            {
+                var nview = GetComponent<ZNetView>();
+                if (nview == null || nview.GetZDO() == null) return false;
+                Player p = user as Player;
+                if (p == null || p != Player.m_localPlayer) return false;
+                ViniTotemPlugin.OpenDialog(transform.position);
+                return true;
+            }
+            catch { return false; }
+        }
+        public bool UseItem(Humanoid user, ItemDrop.ItemData item) { return false; }
+    }
+
+    [HarmonyPatch(typeof(ZNetScene), "Awake")]
+    static class PatchScene
+    {
+        static void Postfix()
+        {
+            try { ViniTotemPlugin.OnWorldLoad(); }
+            catch { }
+        }
+    }
+
+    [HarmonyPatch(typeof(PieceTable), "UpdateAvailable")]
+    static class PatchTable
+    {
+        static void Prefix(PieceTable __instance)
+        {
+            try
+            {
+                if (__instance == null || __instance.gameObject == null) return;
+                ViniTotemPlugin.Log("UpdateAvailable tabela=" + __instance.gameObject.name);
+                if (__instance.gameObject.name.Contains("Hammer"))
+                    ViniTotemPlugin.EnsureInHammerTable(__instance);
+            }
+            catch { }
+        }
+    }
+
+    [HarmonyPatch(typeof(ObjectDB), "Awake")]
+    static class PatchODB
+    {
+        static void Postfix()
+        {
+            try { ViniTotemPlugin.ScrubAllHammerTables(); }
+            catch { }
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), "OnSpawned")]
+    static class PatchSpawned
+    {
+        // Prefix roda antes de qualquer Postfix (ex: AzuEPI) no mesmo metodo.
+        static void Prefix(Player __instance)
+        {
+            try { ViniTotemPlugin.ScrubAllHammerTables(); }
+            catch { }
+            try { ViniTotemPlugin.TeachTotem(__instance); }
+            catch { }
+            ViniTotemPlugin.AllowPlanRescan();
+        }
+    }
+
+    [HarmonyPatch(typeof(Menu), "IsVisible")]
+    static class PatchMenuVisible
+    {
+        static void Postfix(ref bool __result) { if (ViniTotemPlugin.DialogOpen) __result = true; }
+    }
+
+    [HarmonyPatch(typeof(Menu), "IsActive")]
+    static class PatchMenuActive
+    {
+        static void Postfix(ref bool __result) { if (ViniTotemPlugin.DialogOpen) __result = true; }
+    }
+
+    [HarmonyPatch(typeof(GameCamera), "UpdateMouseCapture")]
+    static class PatchMouseCapture
+    {
+        static void Postfix()
+        {
+            if (ViniTotemPlugin.DialogOpen)
+            {
+                ZCursor.Show();
+                UnityEngine.Cursor.lockState = CursorLockMode.None;
+                UnityEngine.Cursor.visible = true;
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), "OnDeath")]
+    static class PatchDeath
+    {
+        static readonly Dictionary<Skills.SkillType, float> _pre = new Dictionary<Skills.SkillType, float>();
+        static void Prefix(Player __instance)
+        {
+            try
+            {
+                if (__instance == null || __instance != Player.m_localPlayer) return;
+                var sk = __instance.GetComponent<Skills>();
+                if (sk == null) return;
+                _pre.Clear();
+                foreach (var s in sk.GetSkillList())
+                    if (s != null && s.m_info != null) _pre[s.m_info.m_skill] = s.m_level;
+            }
+            catch { }
+        }
+        static void Postfix(Player __instance)
+        {
+            try
+            {
+                if (__instance == null || __instance != Player.m_localPlayer) return;
+                var sk = __instance.GetComponent<Skills>();
+                if (sk == null) return;
+                bool any = false;
+                foreach (var s in sk.GetSkillList())
+                {
+                    if (s == null || s.m_info == null) continue;
+                    float before = s.m_level, b;
+                    if (_pre.TryGetValue(s.m_info.m_skill, out b)) before = b;
+                    float diff = before - s.m_level;
+                    if (diff > 0.001f)
+                    {
+                        float cur = 0f, c;
+                        if (ViniTotemPlugin.Lost.TryGetValue(s.m_info.m_skill, out c)) cur = c;
+                        ViniTotemPlugin.Lost[s.m_info.m_skill] = cur + diff;
+                        any = true;
+                    }
+                }
+                _pre.Clear();
+                ViniTotemPlugin.LastDeathTime = Time.time;
+                if (any) ViniTotemPlugin.Claimed = false;
+            }
+            catch { }
+        }
+    }
+}
